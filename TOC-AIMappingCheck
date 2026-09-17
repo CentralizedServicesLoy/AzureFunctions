@@ -1,0 +1,62 @@
+param($Timer)
+
+Write-Host "Function started at $(Get-Date -Format u)"
+
+$Header = @{
+    Authorization  = $env:Authorization
+    clientId       = $env:clientId
+    Accept         = "application/json"
+    "Content-Type" = "application/json"
+}
+
+$id1 = 503
+$id2 = 2457
+$boardName = "Service"
+
+$uri = "https://api-na.myconnectwise.net/v4_6_release/apis/3.0/service/tickets" +
+       "?conditions=board/name='$boardName'%20and%20closedFlag=false%20and%20(type/id=$id1%20OR%20type/id=$id2)" +
+       "&fields=id,summary" +
+       "&pageSize=1"   # Only need to know if at least one exists
+
+try {
+    $tickets = Invoke-RestMethod -Uri $uri -Headers $Header -Method Get -ErrorAction Stop
+}
+catch {
+    Write-Error "ConnectWise API call failed: $_"
+    return
+}
+
+# If anything is returned, PowerShell will treat it as truthy
+if ($tickets) {
+
+    Write-Host "Ticket(s) found. Triggering webhook."
+
+    $payload = @{
+        action = "Go"
+    } | ConvertTo-Json
+
+    $webhookHeaders = @{
+        "x-make-apikey" = $env:WebhookAPIKey
+        "Content-Type"  = "application/json"
+    }
+
+    try {
+        Invoke-RestMethod `
+            -Uri $env:Webhook `
+            -Method Post `
+            -Body $payload `
+            -Headers $webhookHeaders `
+            -ErrorAction Stop
+
+        Write-Host "Webhook sent successfully."
+    }
+    catch {
+        Write-Error "Webhook POST failed: $_"
+    }
+
+}
+else {
+    Write-Host "No matching tickets found."
+}
+
+Write-Host "Function completed at $(Get-Date -Format u)"
