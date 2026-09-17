@@ -1,0 +1,1283 @@
+using namespace System.Net
+
+param($Request, $TriggerMetadata)
+
+# =====================================================================
+# BLACKPOINT COMPASSONE - V3 INSTALLER LOOKUP FUNCTION
+# =====================================================================
+#
+# PURPOSE:
+# This Azure Function accepts a company name as input, performs a fuzzy
+# match against Blackpoint CompassOne tenants, retrieves the current
+# Windows V3 installer information, retrieves the Blackpoint agent
+# authentication token, and returns a complete install command.
+#
+# EXAMPLE REQUEST:
+#
+#   GET /api/Get-BlackpointInstaller?companyName=Town%20Wescott
+#
+# EXAMPLE OUTPUT:
+#
+#   {
+#       "requestedCompany": "Town Wescott",
+#       "match": {
+#           "companyName": "Town of Wescott",
+#           "confidence": 91.2,
+#           "customerId": "...",
+#           "accountId": "..."
+#       },
+#       "installer": {
+#           "version": "...",
+#           "fileName": "...",
+#           "downloadUrl": "...",
+#           "fileHash": "..."
+#       },
+#       "installCommand": ".\blackpoint-agent-....exe CUSTOMER_ID=..."
+#   }
+#
+# IMPORTANT:
+# The Blackpoint V3 installer itself is generic.
+# The CUSTOMER_ID and AUTH_TOKEN are what associate the installation
+# with the correct Blackpoint customer/tenant.
+#
+# =====================================================================
+
+
+
+# =====================================================================
+# SECTION 1 - LOAD CONFIGURATION
+# =====================================================================
+#
+# The Blackpoint API key is stored as an Azure Function Application
+# Setting rather than hard-coded into the script.
+#
+# Azure Function App Setting name:
+#
+#   BLACKPOINT_API_KEY
+#
+# Recommended:
+# Store the actual secret in Azure Key Vault and reference it from
+# the Function App setting.
+#
+# =====================================================================
+
+$ApiKey = $env:BLACKPOINT_API_KEY
+
+
+
+# =====================================================================
+# SECTION 2 - VERIFY API KEY EXISTS
+# =====================================================================
+#
+# Before doing any work, make sure the Function App actually has the
+# Blackpoint API key configured.
+#
+# If it is missing, return HTTP 500 because this is a server-side
+# configuration problem, not a problem with the user's request.
+#
+# =====================================================================
+
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+
+        StatusCode = [HttpStatusCode]::InternalServerError
+
+        Body = @{
+            error = "BLACKPOINT_API_KEY application setting is not configured."
+        } | ConvertTo-Json
+
+        Headers = @{
+            "Content-Type" = "application/json"
+        }
+    })
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 3 - BUILD BLACKPOINT API HEADERS
+# =====================================================================
+#
+# Blackpoint authenticates API requests using a Bearer token.
+#
+# Every request made to CompassOne will reuse this same header object.
+#
+# =====================================================================
+
+$Headers = @{
+
+    Authorization = "Bearer $ApiKey"
+
+    Accept = "application/json"
+}
+
+
+
+# =====================================================================
+# SECTION 4 - FUZZY MATCH SETTINGS
+# =====================================================================
+#
+# These settings control how aggressively the function will match a
+# company name provided by the calling system against Blackpoint.
+#
+# MinimumMatchScore:
+#
+#   Minimum score required before automatically accepting a match.
+#
+#   Example:
+#
+#       Input:  Town Wescot
+#       Match:  Town of Wescott
+#       Score:  91
+#
+#   This would be accepted.
+#
+#
+# AmbiguityGap:
+#
+#   Protects against multiple very similar customers.
+#
+#   Example:
+#
+#       Match 1: ABC Manufacturing     Score 89
+#       Match 2: ABC Manufacturing WI  Score 86
+#
+#   Difference = 3
+#
+#   Since this is less than the configured AmbiguityGap of 8,
+#   the function will NOT automatically select one.
+#
+#   Instead, it returns HTTP 409 and provides possible candidates.
+#
+# This is important because selecting the wrong Blackpoint tenant
+# could deploy an endpoint into the wrong client.
+#
+# =====================================================================
+
+$MinimumMatchScore = 70
+
+$AmbiguityGap = 8
+
+
+
+# =====================================================================
+# FUNCTION: Normalize-CompanyName
+# =====================================================================
+#
+# PURPOSE:
+# Converts company names into a simplified format so that minor
+# differences do not negatively affect matching.
+#
+# Examples:
+#
+#   "WEM Automation LLC"
+#
+# becomes:
+#
+#   "wem automation"
+#
+#
+#   "ABC Manufacturing, Inc."
+#
+# becomes:
+#
+#   "abc manufacturing"
+#
+#
+# The function:
+#
+#   - converts the name to lowercase
+#   - removes punctuation
+#   - removes common company suffixes
+#   - removes extra whitespace
+#
+# =====================================================================
+
+function Normalize-CompanyName {
+
+    param(
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+
+    # Convert everything to lowercase so capitalization is ignored.
+    $Normalized = $Name.ToLowerInvariant()
+
+
+    # Replace punctuation and special characters with spaces.
+    #
+    # Example:
+    #
+    #   ABC-MFG, Inc.
+    #
+    # becomes:
+    #
+    #   abc mfg  inc
+    #
+    $Normalized = $Normalized -replace '[^a-z0-9\s]', ' '
+
+
+    # Common business suffixes that typically do not help identify
+    # one customer from another.
+    $StopWords = @(
+
+        'inc',
+        'incorporated',
+        'llc',
+        'ltd',
+        'limited',
+        'corp',
+        'corporation',
+        'company',
+        'co'
+    )
+
+
+    # Split the company name into individual words.
+    #
+    # Remove:
+    #
+    #   - blank entries
+    #   - common company suffixes
+    #
+    $Words = $Normalized -split '\s+' |
+        Where-Object {
+
+            $_ -and $_ -notin $StopWords
+        }
+
+
+    # Rebuild the normalized company name.
+    return ($Words -join ' ').Trim()
+}
+
+
+
+# =====================================================================
+# FUNCTION: Get-LevenshteinDistance
+# =====================================================================
+#
+# PURPOSE:
+# Calculates the number of single-character changes required to turn
+# one string into another.
+#
+# This implementation uses two one-dimensional integer arrays instead
+# of a multidimensional matrix. That avoids array-indexing issues in
+# Windows PowerShell / Azure Functions PowerShell.
+#
+# =====================================================================
+
+function Get-LevenshteinDistance {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
+
+    # Exact match requires no edits.
+    if ($Source -eq $Target) {
+        return 0
+    }
+
+    # If either string is empty, the distance is the length
+    # of the other string.
+    if ($Source.Length -eq 0) {
+        return $Target.Length
+    }
+
+    if ($Target.Length -eq 0) {
+        return $Source.Length
+    }
+
+    # Initialize the previous row with values:
+    # 0, 1, 2, 3, ...
+    [int[]]$PreviousRow = 0..$Target.Length
+
+    # Process each character in the source string.
+    for ([int]$i = 1; $i -le $Source.Length; $i++) {
+
+        [int[]]$CurrentRow = New-Object int[] ($Target.Length + 1)
+
+        $CurrentRow[0] = $i
+
+        # Compare this source character against each target character.
+        for ([int]$j = 1; $j -le $Target.Length; $j++) {
+
+            if ($Source[$i - 1] -eq $Target[$j - 1]) {
+                $Cost = 0
+            }
+            else {
+                $Cost = 1
+            }
+
+            $Deletion     = $PreviousRow[$j] + 1
+            $Insertion    = $CurrentRow[$j - 1] + 1
+            $Substitution = $PreviousRow[$j - 1] + $Cost
+
+            $CurrentRow[$j] = [Math]::Min(
+                [Math]::Min(
+                    $Deletion,
+                    $Insertion
+                ),
+                $Substitution
+            )
+        }
+
+        $PreviousRow = $CurrentRow
+    }
+
+    return $PreviousRow[$Target.Length]
+}
+
+
+
+# =====================================================================
+# FUNCTION: Get-CompanyMatchScore
+# =====================================================================
+#
+# PURPOSE:
+# Produces a fuzzy-match score between 0 and 100.
+#
+# The score combines multiple matching techniques:
+#
+#   1. Exact normalized match
+#   2. Levenshtein character similarity
+#   3. Word/token overlap
+#   4. Substring matching
+#
+#
+# Why use multiple methods?
+#
+# Because MSP customer names can vary between systems.
+#
+# Example:
+#
+#   RMM:
+#       Town Wescott
+#
+#   Blackpoint:
+#       Town of Wescott
+#
+#
+# Or:
+#
+#   RMM:
+#       WEM Automation LLC
+#
+#   Blackpoint:
+#       WEM Automation
+#
+#
+# =====================================================================
+
+function Get-CompanyMatchScore {
+
+    param(
+
+        [Parameter(Mandatory)]
+        [string]$SearchName,
+
+        [Parameter(Mandatory)]
+        [string]$CandidateName
+    )
+
+
+    # Normalize both names before comparison.
+    $Search = Normalize-CompanyName $SearchName
+
+    $Candidate = Normalize-CompanyName $CandidateName
+
+
+    # If either name is empty after normalization, we cannot compare them.
+    if (-not $Search -or -not $Candidate) {
+
+        return 0
+    }
+
+
+    # A perfect normalized match receives the maximum score.
+    if ($Search -eq $Candidate) {
+
+        return 100
+    }
+
+
+
+    # -----------------------------------------------------------------
+    # CHARACTER SIMILARITY
+    # -----------------------------------------------------------------
+    #
+    # Measure spelling similarity using Levenshtein distance.
+    #
+    # This handles typos such as:
+    #
+    #   Wescot
+    #   Wescott
+    #
+    # -----------------------------------------------------------------
+
+    $Distance = Get-LevenshteinDistance `
+        -Source $Search `
+        -Target $Candidate
+
+
+    $MaxLength = [Math]::Max(
+
+        $Search.Length,
+
+        $Candidate.Length
+    )
+
+
+    if ($MaxLength -gt 0) {
+
+        $LevenshteinScore = `
+            (1 - ($Distance / $MaxLength)) * 100
+    }
+    else {
+
+        $LevenshteinScore = 0
+    }
+
+
+
+    # -----------------------------------------------------------------
+    # TOKEN / WORD MATCHING
+    # -----------------------------------------------------------------
+    #
+    # Compare matching words between the two company names.
+    #
+    # Example:
+    #
+    #   "town wescott"
+    #   "town of wescott"
+    #
+    # Both contain:
+    #
+    #   town
+    #   wescott
+    #
+    # -----------------------------------------------------------------
+
+    $SearchTokens = @(
+
+        $Search -split '\s+' |
+
+        Where-Object { $_ }
+    )
+
+
+    $CandidateTokens = @(
+
+        $Candidate -split '\s+' |
+
+        Where-Object { $_ }
+    )
+
+
+    # Count the words that appear in both names.
+    $MatchingTokens = @(
+
+        $SearchTokens |
+
+        Where-Object {
+
+            $_ -in $CandidateTokens
+        }
+
+    ).Count
+
+
+    # Build a list of all unique words across both names.
+    $TotalUniqueTokens = @(
+
+        $SearchTokens + $CandidateTokens |
+
+        Sort-Object -Unique
+
+    ).Count
+
+
+    if ($TotalUniqueTokens -gt 0) {
+
+        $TokenScore = `
+            ($MatchingTokens / $TotalUniqueTokens) * 100
+    }
+    else {
+
+        $TokenScore = 0
+    }
+
+
+
+    # -----------------------------------------------------------------
+    # SUBSTRING BONUS
+    # -----------------------------------------------------------------
+    #
+    # Give an additional score boost if one normalized company name
+    # completely contains the other.
+    #
+    # Example:
+    #
+    #   "wem automation"
+    #   "wem automation systems"
+    #
+    # -----------------------------------------------------------------
+
+    $SubstringBonus = 0
+
+
+    if (
+
+        $Candidate.Contains($Search) -or
+
+        $Search.Contains($Candidate)
+    ) {
+
+        $SubstringBonus = 15
+    }
+
+
+
+    # -----------------------------------------------------------------
+    # FINAL SCORE
+    # -----------------------------------------------------------------
+    #
+    # Character similarity receives the largest weight.
+    #
+    #   70% character similarity
+    #   30% word similarity
+    #
+    # Substring matches may receive an additional bonus.
+    #
+    # -----------------------------------------------------------------
+
+    $Score = (
+
+        ($LevenshteinScore * 0.70) +
+
+        ($TokenScore * 0.30) +
+
+        $SubstringBonus
+    )
+
+
+    # Prevent the score from exceeding 100.
+    if ($Score -gt 100) {
+
+        $Score = 100
+    }
+
+
+    return [Math]::Round(
+        $Score,
+        2
+    )
+}
+
+
+
+# =====================================================================
+# FUNCTION: Get-AllBlackpointTenants
+# =====================================================================
+#
+# PURPOSE:
+# Retrieves every tenant/customer available to the Blackpoint API key.
+#
+# Blackpoint returns tenant results in pages.
+#
+# This function automatically loops through every page until all
+# tenants have been retrieved.
+#
+# Each tenant record contains information such as:
+#
+#   - tenant/customer name
+#   - customer ID
+#   - account ID
+#
+# Those IDs are later required to retrieve:
+#
+#   - installer information
+#   - authentication token
+#
+# =====================================================================
+
+function Get-AllBlackpointTenants {
+
+
+    # Array that will hold tenants across all API pages.
+    $AllTenants = @()
+
+
+    # Start with the first API page.
+    $Page = 1
+
+
+    # Number of tenants requested per API call.
+    $PageSize = 50
+
+
+    do {
+
+
+        # Build the Blackpoint tenant API request.
+        $Uri = "https://api.blackpointcyber.com/v1/tenants?page=$Page&pageSize=$PageSize&sortBy=name&sortOrder=ASC"
+
+
+        # Query Blackpoint.
+        $Response = Invoke-RestMethod `
+            -Uri $Uri `
+            -Method GET `
+            -Headers $Headers `
+            -ErrorAction Stop
+
+
+        # Add the tenants from this page to our master list.
+        $AllTenants += $Response.data
+
+
+        # Blackpoint tells us how many total pages exist.
+        $TotalPages = $Response.meta.totalPages
+
+
+        # Move to the next page.
+        $Page++
+
+
+    } while ($Page -le $TotalPages)
+
+
+    # Return every tenant as one combined array.
+    return $AllTenants
+}
+
+
+
+# =====================================================================
+# FUNCTION: Send-JsonResponse
+# =====================================================================
+#
+# PURPOSE:
+# Provides a reusable way to send JSON responses back to the caller.
+#
+# Instead of repeating the Azure Function response code throughout
+# the script, other sections can simply call:
+#
+#   Send-JsonResponse -StatusCode 200 -Body $Object
+#
+# =====================================================================
+
+function Send-JsonResponse {
+
+    param(
+
+        [int]$StatusCode,
+
+        [object]$Body
+    )
+
+
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+
+        StatusCode = $StatusCode
+
+        Headers = @{
+
+            "Content-Type" = "application/json"
+        }
+
+        Body = $Body | ConvertTo-Json -Depth 10
+    })
+}
+
+
+
+# =====================================================================
+# SECTION 5 - READ COMPANY NAME FROM REQUEST
+# =====================================================================
+#
+# The function supports two methods of supplying the company name.
+#
+#
+# Method 1 - Query string
+#
+#   GET /api/Get-BlackpointInstaller?companyName=Town%20Wescott
+#
+#
+# Method 2 - JSON request body
+#
+#   {
+#       "companyName": "Town Wescott"
+#   }
+#
+#
+# Query string is checked first.
+#
+# =====================================================================
+
+$CompanyName = $Request.Query.companyName
+
+
+
+# If companyName was not supplied in the query string,
+# try reading it from the JSON body.
+if ([string]::IsNullOrWhiteSpace($CompanyName)) {
+
+    if ($Request.Body) {
+
+        $CompanyName = $Request.Body.companyName
+    }
+}
+
+# =====================================================================
+# LOG INCOMING REQUEST
+# =====================================================================
+
+Write-Host "============================================================"
+Write-Host "Blackpoint Installer Lookup Started"
+Write-Host "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Host "Requested Company: $CompanyName"
+Write-Host "============================================================"
+
+# If companyName was not provided at all, return HTTP 400.
+if ([string]::IsNullOrWhiteSpace($CompanyName)) {
+
+    Send-JsonResponse `
+        -StatusCode 400 `
+        -Body @{
+
+            error = "companyName is required."
+
+            example = "?companyName=Town%20of%20Wescott"
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 6 - RETRIEVE BLACKPOINT TENANTS
+# =====================================================================
+#
+# Download the current tenant/customer list from Blackpoint.
+#
+# This is done dynamically on every function call so newly added
+# customers are automatically available without maintaining a static
+# lookup table.
+#
+# =====================================================================
+
+try {
+
+    $Tenants = Get-AllBlackpointTenants
+}
+catch {
+
+    Send-JsonResponse `
+        -StatusCode 502 `
+        -Body @{
+
+            error = "Failed retrieving Blackpoint tenants."
+
+            message = $_.Exception.Message
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 7 - SCORE EVERY BLACKPOINT CUSTOMER
+# =====================================================================
+#
+# Compare the supplied company name against every Blackpoint tenant.
+#
+# Each tenant receives a fuzzy-match score.
+#
+# The results are then sorted highest-to-lowest.
+#
+# =====================================================================
+
+$Matches = foreach ($Tenant in $Tenants) {
+
+
+    $Score = Get-CompanyMatchScore `
+        -SearchName $CompanyName `
+        -CandidateName $Tenant.name
+
+
+    [PSCustomObject]@{
+
+        Name = $Tenant.name
+
+        CustomerId = $Tenant.id
+
+        AccountId = $Tenant.accountId
+
+        Score = $Score
+
+        # Keep the complete tenant object available for later use.
+        Tenant = $Tenant
+    }
+}
+
+
+
+# Sort the strongest match first.
+$Matches = @(
+
+    $Matches |
+
+    Sort-Object Score -Descending
+)
+
+Write-Host ""
+Write-Host "Top company match candidates:"
+
+$Matches |
+    Select-Object -First 3 |
+    ForEach-Object {
+        Write-Host ("Candidate: {0} | Score: {1} | CustomerId: {2}" -f `
+            $_.Name,
+            $_.Score,
+            $_.CustomerId)
+    }
+
+# The first result is the highest-confidence match.
+$BestMatch = $Matches[0]
+
+
+
+# Save the second-best match so we can detect ambiguous results.
+if ($Matches.Count -gt 1) {
+
+    $SecondBest = $Matches[1]
+}
+else {
+
+    $SecondBest = $null
+}
+
+
+
+# =====================================================================
+# SECTION 8 - REJECT LOW-CONFIDENCE MATCHES
+# =====================================================================
+#
+# If the best match is below the configured threshold, the function
+# refuses to select a tenant.
+#
+# Instead it returns the top five candidates so the caller can review
+# the possible matches.
+#
+# =====================================================================
+
+if ($BestMatch.Score -lt $MinimumMatchScore) {
+
+    Send-JsonResponse `
+        -StatusCode 404 `
+        -Body @{
+
+            error = "No sufficiently close Blackpoint customer match found."
+
+            requestedCompany = $CompanyName
+
+            minimumScore = $MinimumMatchScore
+
+            candidates = @(
+
+                $Matches |
+
+                Select-Object -First 5 `
+                    Name,
+                    CustomerId,
+                    Score
+            )
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 9 - REJECT AMBIGUOUS MATCHES
+# =====================================================================
+#
+# Even if the top result has a good score, we do not want to
+# automatically select it if another customer has nearly the same score.
+#
+# Example:
+#
+#   ABC Manufacturing      91
+#   ABC Manufacturing WI   88
+#
+# With an AmbiguityGap of 8, this would be considered unsafe.
+#
+# The function returns HTTP 409 instead of guessing.
+#
+# =====================================================================
+
+if (
+
+    $SecondBest -and
+
+    (($BestMatch.Score - $SecondBest.Score) -lt $AmbiguityGap)
+) {
+
+    Send-JsonResponse `
+        -StatusCode 409 `
+        -Body @{
+
+            error = "Multiple Blackpoint customers are close matches."
+
+            requestedCompany = $CompanyName
+
+            candidates = @(
+
+                $Matches |
+
+                Select-Object -First 5 `
+                    Name,
+                    CustomerId,
+                    Score
+            )
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 10 - STORE MATCHED TENANT INFORMATION
+# =====================================================================
+#
+# At this point:
+#
+#   - the match score is high enough
+#   - the result is not ambiguous
+#
+# Save the identifiers needed for the remaining Blackpoint API calls.
+#
+# =====================================================================
+
+$Tenant = $BestMatch.Tenant
+
+$CustomerId = $Tenant.id
+
+$CustomerName = $Tenant.name
+
+$AccountId = $Tenant.accountId
+
+
+
+# =====================================================================
+# SECTION 11 - GET CURRENT WINDOWS V3 INSTALLER
+# =====================================================================
+#
+# This endpoint retrieves the CURRENT Blackpoint V3 Windows installer.
+#
+# Blackpoint normally returns a download URL hosted at:
+#
+#   https://agent.blackpointcyber.com/...
+#
+# During testing, Blackpoint occasionally returned a temporary
+# pre-signed Amazon S3 URL instead. Those S3 URLs returned HTTP 404
+# from the client during some deployment attempts.
+#
+# To avoid returning an unusable installer URL, this section retries
+# the Blackpoint installer lookup if the returned URL is not hosted on
+# agent.blackpointcyber.com.
+#
+# =====================================================================
+
+$InstallerUri = `
+    "https://api.blackpointcyber.com/v2/agentUpdate/latestByComponent?component=core&customerId=$CustomerId&installer=exe&platform=windows"
+
+$MaxInstallerAttempts = 3
+$InstallerRetryDelaySeconds = 3
+
+$Installer = $null
+$ValidInstallerUrl = $false
+
+
+try {
+
+    for ($Attempt = 1; $Attempt -le $MaxInstallerAttempts; $Attempt++) {
+
+        Write-Host "Installer lookup attempt $Attempt of $MaxInstallerAttempts"
+
+        $Installer = Invoke-RestMethod `
+            -Uri $InstallerUri `
+            -Method GET `
+            -Headers $Headers `
+            -ErrorAction Stop
+
+        Write-Host "Installer Version: $($Installer.version)"
+        Write-Host "Installer File: $($Installer.fileName)"
+        Write-Host "Installer URL Host: $(([uri]$Installer.downloadUrl).Host)"
+
+        # -------------------------------------------------------------
+        # Validate returned download URL
+        # -------------------------------------------------------------
+        #
+        # Expected:
+        #
+        #   https://agent.blackpointcyber.com/...
+        #
+        # Unexpected examples observed during testing:
+        #
+        #   https://component-version-service-production.s3...
+        #
+        # -------------------------------------------------------------
+
+        if (
+            -not [string]::IsNullOrWhiteSpace($Installer.downloadUrl) -and
+            $Installer.downloadUrl -match '^https://agent\.blackpointcyber\.com/'
+        ) {
+
+            $ValidInstallerUrl = $true
+
+            Write-Host "Valid Blackpoint installer URL received."
+
+            break
+        }
+
+
+        Write-Warning "Unexpected Blackpoint installer URL returned."
+
+        if (-not [string]::IsNullOrWhiteSpace($Installer.downloadUrl)) {
+
+            try {
+
+                $ReturnedHost = ([uri]$Installer.downloadUrl).Host
+
+                Write-Warning "Returned installer host: $ReturnedHost"
+            }
+            catch {
+
+                Write-Warning "Returned installer URL could not be parsed."
+            }
+        }
+
+
+        # Wait briefly before asking Blackpoint again.
+        if ($Attempt -lt $MaxInstallerAttempts) {
+
+            Write-Host "Waiting $InstallerRetryDelaySeconds seconds before retry..."
+
+            Start-Sleep -Seconds $InstallerRetryDelaySeconds
+        }
+    }
+
+
+    # -------------------------------------------------------------
+    # Final validation
+    # -------------------------------------------------------------
+
+    if (-not $ValidInstallerUrl) {
+
+        throw "Blackpoint did not return an agent.blackpointcyber.com installer URL after $MaxInstallerAttempts attempts."
+    }
+
+}
+catch {
+
+    Write-Host "Installer lookup failed."
+    Write-Host "Error: $($_.Exception.Message)"
+
+    Send-JsonResponse `
+        -StatusCode 502 `
+        -Body @{
+
+            error = "Failed retrieving a valid Blackpoint V3 installer."
+
+            customer = $CustomerName
+
+            attempts = $MaxInstallerAttempts
+
+            message = $_.Exception.Message
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 12 - GET BLACKPOINT AGENT AUTH TOKEN
+# =====================================================================
+#
+# The V3 agent requires an AUTH_TOKEN during installation.
+#
+# This token is retrieved at the Blackpoint ACCOUNT level.
+#
+# The matched tenant provides an AccountId, which is used in the
+# endpoint below.
+#
+# IMPORTANT:
+#
+# This token should be treated as sensitive credential material.
+#
+# Do not log it.
+# Do not write it to public logs.
+# Do not expose it to unauthorized callers.
+#
+# =====================================================================
+
+try {
+
+
+    $TokenUri = `
+        "https://api.blackpointcyber.com/v1/accounts/$AccountId/certificates/agent-auth-token"
+
+
+    $TokenResponse = Invoke-RestMethod `
+        -Uri $TokenUri `
+        -Method GET `
+        -Headers $Headers `
+        -ErrorAction Stop
+
+
+    $AuthToken = $TokenResponse.token
+
+}
+catch {
+
+    Send-JsonResponse `
+        -StatusCode 502 `
+        -Body @{
+
+            error = "Failed retrieving Blackpoint agent auth token."
+
+            customer = $CustomerName
+
+            accountId = $AccountId
+
+            message = $_.Exception.Message
+        }
+
+    return
+}
+
+
+
+# =====================================================================
+# SECTION 13 - BUILD BLACKPOINT INSTALL COMMAND
+# =====================================================================
+#
+# Construct the exact command that can be used to install the current
+# Blackpoint V3 agent.
+#
+#
+# Example:
+#
+#   .\blackpoint-agent-3.1.0-92.exe `
+#       CUSTOMER_ID="433f8258-..." `
+#       AUTH_TOKEN="..." `
+#       /passive
+#
+#
+# CUSTOMER_ID:
+#
+#   Associates the endpoint with the matched Blackpoint tenant.
+#
+#
+# AUTH_TOKEN:
+#
+#   Authorizes the endpoint registration.
+#
+#
+# /passive:
+#
+#   Runs the installation with minimal user interaction.
+#
+# =====================================================================
+
+$InstallCommand = `
+    ".\$($Installer.fileName) CUSTOMER_ID=`"$CustomerId`" AUTH_TOKEN=`"$AuthToken`" /passive"
+
+
+
+# =====================================================================
+# SECTION 14 - RETURN SUCCESS RESPONSE
+# =====================================================================
+#
+# Return all useful deployment information to the calling automation.
+#
+# The response includes:
+#
+#   - original requested company
+#   - matched Blackpoint company
+#   - match confidence
+#   - customer ID
+#   - account ID
+#   - current installer version
+#   - current file name
+#   - download URL
+#   - file hash
+#   - complete install command
+#
+# =====================================================================
+
+Send-JsonResponse `
+    -StatusCode 200 `
+    -Body @{
+
+
+        # -------------------------------------------------------------
+        # What the caller originally requested.
+        # -------------------------------------------------------------
+
+        requestedCompany = $CompanyName
+
+
+        # -------------------------------------------------------------
+        # Information about the fuzzy-matched Blackpoint tenant.
+        # -------------------------------------------------------------
+
+        match = @{
+
+            companyName = $CustomerName
+
+            confidence = $BestMatch.Score
+
+            customerId = $CustomerId
+
+            accountId = $AccountId
+        }
+
+
+        # -------------------------------------------------------------
+        # Current Blackpoint Windows V3 installer information.
+        # -------------------------------------------------------------
+
+        installer = @{
+
+            version = $Installer.version
+
+            fileName = $Installer.fileName
+
+            downloadUrl = $Installer.downloadUrl
+
+            fileHash = $Installer.fileHash
+        }
+
+
+        # -------------------------------------------------------------
+        # Complete deployment command.
+        # -------------------------------------------------------------
+
+        installCommand = $InstallCommand
+    }
