@@ -1,0 +1,47 @@
+using namespace System.Net
+
+# Input bindings are passed in via param block.
+param($Request, $TriggerMetadata)
+
+# Write to the Azure Functions log stream.
+Write-output "PowerShell HTTP trigger function processed a request."
+Write-output $Request #For debug logging
+
+
+$APIKey = $ENV:OpsGenieAPIKey
+$Message = $Request.Query.Message
+$Alias = $Request.Query.Alias
+$Description = $Request.Query.Description
+$Name = $Request.Query.Name
+$Type = $Request.Query.Type
+$Atype = $Request.Query.Atype
+
+
+function New-OpsGenieAlertUser{
+ 
+    $AlertURL = "https://api.opsgenie.com/v2/alerts"
+ 
+    $Headers = @{
+            'Authorization' = "GenieKey $APIKey"
+            'Content-Type' = "application/json"
+    }
+ 
+    $AlertBody = @"
+    {
+        "message": "$Message",
+        "alias": "$Alias",
+        "description":"$Description",
+        "responders":[
+            {"$Atype":"$Name", "type":"$Type"}
+        ]
+    }
+"@
+ 
+    Invoke-RestMethod -URI $AlertURL -Method Post -Headers $Headers -Body $AlertBody -UseBasicParsing
+ 
+}
+
+Write-output "Message destination is $Name"
+
+New-OpsGenieAlertUser
+
