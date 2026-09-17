@@ -1,0 +1,977 @@
+<#
+.SYNOPSIS
+    Creates a ConnectWise PSA ticket containing SentinelOne agents
+    that have not been active for more than the configured number of days.
+
+.DESCRIPTION
+    - Runs as an Azure Functions PowerShell timer-triggered function.
+    - Queries the SentinelOne API for stale agents.
+    - Excludes decommissioned and uninstalled agents.
+    - Handles SentinelOne cursor-based pagination.
+    - Calculates completed days offline.
+    - Groups agents by SentinelOne site.
+    - Creates a new ConnectWise PSA ticket when stale agents are found.
+    - Creates no ticket when no stale agents are found.
+    - Writes activity and failures to Azure Functions logs.
+    - Displays report timestamps in Central Time.
+
+.REQUIRED APPLICATION SETTINGS
+    OFFLINE_DAYS_THRESHOLD
+    SENTINELONE_BASE_URL
+    SENTINELONE_API_TOKEN
+    CONNECTWISE_BASE_URL
+    CONNECTWISE_BEARER_TOKEN
+    CONNECTWISE_CLIENT_ID
+    TICKET_COMPANY_IDENTIFIER
+    TICKET_BOARD_NAME
+
+.NOTES
+    ConnectWise authentication uses the existing encoded token in a
+    Basic Authorization header:
+
+        Authorization = "Basic <token>"
+#>
+
+param($Timer)
+
+$ErrorActionPreference = "Stop"
+
+# ============================================================
+# Static configuration
+# ============================================================
+
+$TicketStatusName   = "New"
+$TicketPriorityName = "Priority 3 - Normal Response"
+
+$TicketTypeName    = $null
+$TicketSubtypeName = $null
+$TicketItemName    = $null
+
+$SentinelOneAccountIds = ""
+$SentinelOneSiteIds    = ""
+
+# ============================================================
+# Environment configuration
+# ============================================================
+
+$SentinelOneBaseUrl  = $env:SENTINELONE_BASE_URL
+$SentinelOneApiToken = $env:SENTINELONE_API_TOKEN
+
+$ConnectWiseBaseUrl     = $env:CONNECTWISE_BASE_URL
+$ConnectWiseBearerToken = $env:CONNECTWISE_BEARER_TOKEN
+$ConnectWiseClientId    = $env:CONNECTWISE_CLIENT_ID
+
+$TicketCompanyIdentifier = $env:TICKET_COMPANY_IDENTIFIER
+$TicketBoardName         = $env:TICKET_BOARD_NAME
+
+$OfflineDaysThreshold = 0
+
+if (
+    -not [int]::TryParse(
+        $env:OFFLINE_DAYS_THRESHOLD,
+        [ref]$OfflineDaysThreshold
+    )
+) {
+    throw "OFFLINE_DAYS_THRESHOLD must contain a valid integer."
+}
+
+if (
+    $OfflineDaysThreshold -lt 1 -or
+    $OfflineDaysThreshold -gt 365
+) {
+    throw "OFFLINE_DAYS_THRESHOLD must be between 1 and 365."
+}
+
+# ============================================================
+# Functions
+# ============================================================
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet("INFO", "WARN", "ERROR")]
+        [string]$Level = "INFO"
+    )
+
+    $Timestamp = (Get-Date).ToUniversalTime().ToString(
+        "yyyy-MM-ddTHH:mm:ss.fffZ"
+    )
+
+    $LogLine = "[$Timestamp] [$Level] $Message"
+
+    switch ($Level) {
+        "WARN" {
+            Write-Warning $LogLine
+        }
+
+        "ERROR" {
+            Write-Host $LogLine
+        }
+
+        default {
+            Write-Host $LogLine
+        }
+    }
+}
+
+function Get-CentralTimeZone {
+    [CmdletBinding()]
+    param()
+
+    $TimeZoneNames = @(
+        "Central Standard Time",
+        "America/Chicago"
+    )
+
+    foreach ($TimeZoneName in $TimeZoneNames) {
+        try {
+            return [System.TimeZoneInfo]::FindSystemTimeZoneById(
+                $TimeZoneName
+            )
+        }
+        catch {
+            continue
+        }
+    }
+
+    throw (
+        "Unable to locate a Central Time time zone. " +
+        "Tried 'Central Standard Time' and 'America/Chicago'."
+    )
+}
+
+function ConvertTo-CentralTime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$DateTime
+    )
+
+    $CentralTimeZone = Get-CentralTimeZone
+
+    $UtcDateTime = if ($DateTime.Kind -eq [DateTimeKind]::Utc) {
+        $DateTime
+    }
+    else {
+        $DateTime.ToUniversalTime()
+    }
+
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc(
+        $UtcDateTime,
+        $CentralTimeZone
+    )
+}
+
+function ConvertTo-QueryString {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Parameters
+    )
+
+    return (
+        $Parameters.GetEnumerator() |
+            Sort-Object Key |
+            ForEach-Object {
+                $EncodedKey = [uri]::EscapeDataString(
+                    [string]$_.Key
+                )
+
+                $EncodedValue = [uri]::EscapeDataString(
+                    [string]$_.Value
+                )
+
+                "$EncodedKey=$EncodedValue"
+            }
+    ) -join "&"
+}
+
+function Assert-Configuration {
+    [CmdletBinding()]
+    param()
+
+    $RequiredValues = [ordered]@{
+        OFFLINE_DAYS_THRESHOLD    = $env:OFFLINE_DAYS_THRESHOLD
+        SENTINELONE_BASE_URL      = $SentinelOneBaseUrl
+        SENTINELONE_API_TOKEN     = $SentinelOneApiToken
+        CONNECTWISE_BASE_URL      = $ConnectWiseBaseUrl
+        CONNECTWISE_BEARER_TOKEN  = $ConnectWiseBearerToken
+        CONNECTWISE_CLIENT_ID     = $ConnectWiseClientId
+        TICKET_COMPANY_IDENTIFIER = $TicketCompanyIdentifier
+        TICKET_BOARD_NAME         = $TicketBoardName
+    }
+
+    foreach ($Setting in $RequiredValues.GetEnumerator()) {
+        if (
+            [string]::IsNullOrWhiteSpace(
+                [string]$Setting.Value
+            )
+        ) {
+            throw (
+                "Required Function App setting " +
+                "'$($Setting.Key)' is missing or blank."
+            )
+        }
+    }
+
+    if (
+        -not [uri]::IsWellFormedUriString(
+            $SentinelOneBaseUrl,
+            [UriKind]::Absolute
+        )
+    ) {
+        throw "SENTINELONE_BASE_URL is not a valid absolute URL."
+    }
+
+    if (
+        -not [uri]::IsWellFormedUriString(
+            $ConnectWiseBaseUrl,
+            [UriKind]::Absolute
+        )
+    ) {
+        throw "CONNECTWISE_BASE_URL is not a valid absolute URL."
+    }
+}
+
+function Get-SentinelOneOfflineAgents {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory)]
+        [datetime]$CutoffDate,
+
+        [string]$AccountIds,
+
+        [string]$SiteIds
+    )
+
+    $BaseUrl = $BaseUrl.TrimEnd("/")
+
+    $AllAgents = [System.Collections.Generic.List[object]]::new()
+    $Cursor = $null
+    $PageNumber = 0
+
+    do {
+        $PageNumber++
+
+        $QueryParameters = @{
+            lastActiveDate__lt = $CutoffDate.ToUniversalTime().ToString(
+                "yyyy-MM-ddTHH:mm:ss.fffZ"
+            )
+            isDecommissioned = "false"
+            isUninstalled   = "false"
+            limit           = 1000
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($AccountIds)) {
+            $QueryParameters.accountIds = $AccountIds
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($SiteIds)) {
+            $QueryParameters.siteIds = $SiteIds
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($Cursor)) {
+            $QueryParameters.cursor = $Cursor
+        }
+
+        $QueryString = ConvertTo-QueryString `
+            -Parameters $QueryParameters
+
+        $Uri = "$BaseUrl/web/api/v2.1/agents?$QueryString"
+
+        Write-Log "Retrieving SentinelOne page $PageNumber."
+
+        $Response = Invoke-RestMethod `
+            -Method Get `
+            -Uri $Uri `
+            -Headers $Headers `
+            -ContentType "application/json"
+
+        if (
+            $Response.errors -and
+            @($Response.errors).Count -gt 0
+        ) {
+            $ErrorText = $Response.errors |
+                ConvertTo-Json -Depth 10 -Compress
+
+            throw "SentinelOne returned an API error: $ErrorText"
+        }
+
+        $PageAgents = @($Response.data)
+
+        foreach ($Agent in $PageAgents) {
+            $AllAgents.Add($Agent)
+        }
+
+        Write-Log (
+            "SentinelOne page $PageNumber returned " +
+            "$($PageAgents.Count) agent(s)."
+        )
+
+        $Cursor = $Response.pagination.nextCursor
+
+    } while (-not [string]::IsNullOrWhiteSpace($Cursor))
+
+    Write-Log (
+        "SentinelOne pagination completed after " +
+        "$PageNumber page(s)."
+    )
+
+    return $AllAgents
+}
+
+function New-AgentReportText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Agents,
+
+        [Parameter(Mandatory)]
+        [datetime]$ReportDate,
+
+        [Parameter(Mandatory)]
+        [datetime]$CutoffDate,
+
+        [Parameter(Mandatory)]
+        [int]$ThresholdDays
+    )
+
+    $ReportDateCentral = ConvertTo-CentralTime `
+        -DateTime $ReportDate
+
+    $CutoffDateCentral = ConvertTo-CentralTime `
+        -DateTime $CutoffDate
+
+    $ReportDateText = $ReportDateCentral.ToString(
+        "yyyy-MM-dd HH:mm:ss"
+    )
+
+    $CutoffDateText = $CutoffDateCentral.ToString(
+        "yyyy-MM-dd HH:mm:ss"
+    )
+
+    $SiteSections = foreach (
+        $Site in (
+            $Agents |
+                Group-Object SiteName |
+                Sort-Object Name
+        )
+    ) {
+        $SiteName = if (
+            [string]::IsNullOrWhiteSpace($Site.Name)
+        ) {
+            "Unknown Site"
+        }
+        else {
+            $Site.Name
+        }
+
+        $AgentList = foreach (
+            $Agent in (
+                $Site.Group |
+                    Sort-Object `
+                        @{
+                            Expression = "DaysOffline"
+                            Descending = $true
+                        },
+                        @{
+                            Expression = "ComputerName"
+                            Descending = $false
+                        }
+            )
+        ) {
+@"
+**$($Agent.ComputerName)**
+
+- **SentinelOne ID:** $($Agent.SentinelOneId)
+- **Days Offline:** $($Agent.DaysOffline)
+
+"@
+        }
+
+@"
+**$SiteName**
+
+$($AgentList -join [Environment]::NewLine)
+
+"@
+    }
+
+    return @"
+**SentinelOne Offline Agent Report**
+
+- **Report Date:** $ReportDateText Central Time
+- **Offline Threshold:** More than $ThresholdDays days
+- **Cutoff Date:** $CutoffDateText Central Time
+- **Agents Found:** $($Agents.Count)
+
+The following SentinelOne agents have not communicated with the management console for more than $ThresholdDays full days.
+
+$($SiteSections -join [Environment]::NewLine)
+
+**Recommended Action**
+
+Review each endpoint to determine whether it is powered off, retired, renamed, disconnected from the network, or experiencing a SentinelOne agent communication issue.
+"@
+}
+
+function New-ConnectWiseTicket {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory)]
+        [string]$Summary,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [string]$CompanyIdentifier,
+
+        [Parameter(Mandatory)]
+        [string]$BoardName,
+
+        [Parameter(Mandatory)]
+        [string]$StatusName,
+
+        [Parameter(Mandatory)]
+        [string]$PriorityName,
+
+        [AllowNull()]
+        [string]$TypeName,
+
+        [AllowNull()]
+        [string]$SubtypeName,
+
+        [AllowNull()]
+        [string]$ItemName
+    )
+
+    $BaseUrl = $BaseUrl.TrimEnd("/")
+
+    $TicketUri = (
+        "$BaseUrl/v4_6_release/apis/3.0/service/tickets"
+    )
+
+    $TicketBody = @{
+        summary = $Summary
+
+        company = @{
+            identifier = $CompanyIdentifier
+        }
+
+        board = @{
+            name = $BoardName
+        }
+
+        status = @{
+            name = $StatusName
+        }
+
+        priority = @{
+            name = $PriorityName
+        }
+
+        initialDescription = $Description
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TypeName)) {
+        $TicketBody.type = @{
+            name = $TypeName
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SubtypeName)) {
+        $TicketBody.subType = @{
+            name = $SubtypeName
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ItemName)) {
+        $TicketBody.item = @{
+            name = $ItemName
+        }
+    }
+
+    $JsonBody = $TicketBody |
+        ConvertTo-Json -Depth 10
+
+    Write-Log "Submitting ConnectWise ticket API POST request."
+
+    $HttpHandler = $null
+    $HttpClient = $null
+    $HttpContent = $null
+    $HttpResponse = $null
+
+    try {
+        $HttpHandler = [System.Net.Http.HttpClientHandler]::new()
+        $HttpHandler.AllowAutoRedirect = $false
+
+        $HttpClient = [System.Net.Http.HttpClient]::new(
+            $HttpHandler
+        )
+
+        foreach ($Header in $Headers.GetEnumerator()) {
+            if ($Header.Key -eq "Content-Type") {
+                continue
+            }
+
+            $null = (
+                $HttpClient.DefaultRequestHeaders.TryAddWithoutValidation(
+                    [string]$Header.Key,
+                    [string]$Header.Value
+                )
+            )
+        }
+
+        $HttpContent = [System.Net.Http.StringContent]::new(
+            $JsonBody,
+            [System.Text.Encoding]::UTF8,
+            "application/json"
+        )
+
+        Write-Log (
+            "Sending ConnectWise ticket POST with " +
+            "automatic redirects disabled."
+        )
+
+        $HttpResponse = $HttpClient.PostAsync(
+            $TicketUri,
+            $HttpContent
+        ).GetAwaiter().GetResult()
+
+        $StatusCode = [int]$HttpResponse.StatusCode
+
+        $ResponseBody = (
+            $HttpResponse.Content.ReadAsStringAsync()
+        ).GetAwaiter().GetResult()
+
+        $RedirectLocation = $null
+
+        if ($null -ne $HttpResponse.Headers.Location) {
+            $RedirectLocation = (
+                $HttpResponse.Headers.Location.ToString()
+            )
+        }
+
+        Write-Log (
+            "ConnectWise returned HTTP status $StatusCode."
+        )
+
+        if ($RedirectLocation) {
+            Write-Log (
+                "ConnectWise returned a redirect. " +
+                "The redirect was intentionally not followed. " +
+                "Location='$RedirectLocation'"
+            )
+        }
+
+        if ($StatusCode -lt 200 -or $StatusCode -ge 400) {
+            $SafeResponseBody = if (
+                [string]::IsNullOrWhiteSpace($ResponseBody)
+            ) {
+                "<No response body returned>"
+            }
+            else {
+                $ResponseBody
+            }
+
+            throw (
+                "ConnectWise ticket creation failed. " +
+                "HTTP status: $StatusCode. " +
+                "Response: $SafeResponseBody"
+            )
+        }
+
+        $ParsedResponse = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($ResponseBody)) {
+            try {
+                $ParsedResponse = $ResponseBody |
+                    ConvertFrom-Json -ErrorAction Stop
+            }
+            catch {
+                Write-Log `
+                    -Message (
+                        "ConnectWise returned a non-JSON response body."
+                    ) `
+                    -Level "WARN"
+            }
+        }
+
+        return [pscustomobject]@{
+            Success          = $true
+            StatusCode       = $StatusCode
+            RedirectLocation = $RedirectLocation
+            Ticket           = $ParsedResponse
+        }
+    }
+    finally {
+        if ($null -ne $HttpResponse) {
+            $HttpResponse.Dispose()
+        }
+
+        if ($null -ne $HttpContent) {
+            $HttpContent.Dispose()
+        }
+
+        if ($null -ne $HttpClient) {
+            $HttpClient.Dispose()
+        }
+
+        if ($null -ne $HttpHandler) {
+            $HttpHandler.Dispose()
+        }
+    }
+}
+
+# ============================================================
+# Main
+# ============================================================
+
+try {
+    Write-Log "========================================================"
+    Write-Log "SentinelOne Offline Agent Azure Function started."
+    Write-Log "========================================================"
+
+    if ($null -ne $Timer) {
+        if ($Timer.IsPastDue) {
+            Write-Log `
+                -Message "The timer-triggered execution is past due." `
+                -Level "WARN"
+        }
+    }
+
+    Assert-Configuration
+
+    Write-Log "Configuration validation completed successfully."
+
+    # ========================================================
+    # API headers
+    # ========================================================
+
+    $SentinelOneHeaders = @{
+        Authorization = "ApiToken $SentinelOneApiToken"
+        Accept        = "application/json"
+    }
+
+    $ConnectWiseHeaders = @{
+        Authorization  = "Basic $ConnectWiseBearerToken"
+        clientId       = $ConnectWiseClientId
+        "Content-Type" = "application/json"
+        Accept         = "application/json"
+    }
+
+    Write-Log "SentinelOne authentication header created."
+    Write-Log "ConnectWise authentication header created."
+
+    # ========================================================
+    # Report dates
+    # ========================================================
+
+    $CurrentUtc = (Get-Date).ToUniversalTime()
+
+    $CutoffDate = $CurrentUtc.AddDays(
+        -$OfflineDaysThreshold
+    )
+
+    $ReportDateCentral = ConvertTo-CentralTime `
+        -DateTime $CurrentUtc
+
+    $ReportDateText = $ReportDateCentral.ToString(
+        "dddd MMMM d yyyy"
+    )
+
+    $TicketSummary = (
+        "SentinelOne Offline Agent Report - $ReportDateText"
+    )
+
+    Write-Log (
+        "Report date: " +
+        "$($ReportDateCentral.ToString('yyyy-MM-dd HH:mm:ss')) " +
+        "Central Time."
+    )
+
+    Write-Log (
+        "Offline threshold: More than " +
+        "$OfflineDaysThreshold days."
+    )
+
+    Write-Log (
+        "Cutoff UTC: " +
+        "$($CutoffDate.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
+    )
+
+    Write-Log "Ticket summary: $TicketSummary"
+
+    # ========================================================
+    # Retrieve SentinelOne agents
+    # ========================================================
+
+    Write-Log "Starting SentinelOne offline-agent query."
+
+    $SentinelOneAgents = Get-SentinelOneOfflineAgents `
+        -BaseUrl $SentinelOneBaseUrl `
+        -Headers $SentinelOneHeaders `
+        -CutoffDate $CutoffDate `
+        -AccountIds $SentinelOneAccountIds `
+        -SiteIds $SentinelOneSiteIds
+
+    Write-Log (
+        "SentinelOne returned " +
+        "$($SentinelOneAgents.Count) matching agent(s)."
+    )
+
+    # ========================================================
+    # Build report objects
+    # ========================================================
+
+    $Results = @(
+        $SentinelOneAgents |
+            ForEach-Object {
+                $LastActiveUtc = $null
+                $LastActiveCentral = $null
+                $DaysOffline = $null
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        $_.lastActiveDate
+                    )
+                ) {
+                    $LastActiveUtc = (
+                        [datetime]$_.lastActiveDate
+                    ).ToUniversalTime()
+
+                    $LastActiveCentral = ConvertTo-CentralTime `
+                        -DateTime $LastActiveUtc
+
+                    $DaysOffline = [math]::Floor(
+                        (
+                            $CurrentUtc - $LastActiveUtc
+                        ).TotalDays
+                    )
+                }
+
+                [pscustomobject]@{
+                    ComputerName = $_.computerName
+                    AccountName = $_.accountName
+                    SiteName = $_.siteName
+                    GroupName = $_.groupName
+                    OperatingSystem = $_.osName
+                    AgentVersion = $_.agentVersion
+
+                    LastActiveUtc = $LastActiveUtc
+
+                    LastActiveDisplay = if ($LastActiveCentral) {
+                        $LastActiveCentral.ToString(
+                            "yyyy-MM-dd HH:mm:ss"
+                        )
+                    }
+                    else {
+                        "Unknown"
+                    }
+
+                    DaysOffline = $DaysOffline
+                    SentinelOneId = $_.id
+                }
+            } |
+            Where-Object {
+                $null -ne $_.DaysOffline -and
+                $_.DaysOffline -ge $OfflineDaysThreshold
+            } |
+            Sort-Object `
+                @{
+                    Expression = "DaysOffline"
+                    Descending = $true
+                },
+                @{
+                    Expression = "ComputerName"
+                    Descending = $false
+                }
+    )
+
+    Write-Log (
+        "Processed $($Results.Count) offline-agent record(s)."
+    )
+
+    # ========================================================
+    # No matches
+    # ========================================================
+
+    if ($Results.Count -eq 0) {
+        Write-Log (
+            "No SentinelOne agents exceeded the " +
+            "offline threshold."
+        )
+
+        Write-Log "ConnectWise ticket creation skipped."
+        Write-Log "Function completed successfully."
+
+        return
+    }
+
+    # ========================================================
+    # Log stale agents
+    # ========================================================
+
+    foreach ($Agent in $Results) {
+        Write-Log (
+            "Offline agent: " +
+            "Computer='$($Agent.ComputerName)'; " +
+            "Account='$($Agent.AccountName)'; " +
+            "Site='$($Agent.SiteName)'; " +
+            "SentinelOneId='$($Agent.SentinelOneId)'; " +
+            "LastActiveCentral='$($Agent.LastActiveDisplay)'; " +
+            "DaysOffline='$($Agent.DaysOffline)'"
+        )
+    }
+
+# ========================================================
+# Function log report
+# ========================================================
+
+Write-Log "========================================================"
+Write-Log (
+    "SentinelOne agents offline for more than " +
+    "$OfflineDaysThreshold days."
+)
+Write-Log (
+    "Cutoff UTC: " +
+    "$($CutoffDate.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
+)
+Write-Log "Agents found: $($Results.Count)"
+Write-Log "========================================================"
+
+$LogNumber = 0
+
+foreach ($Agent in $Results) {
+    $LogNumber++
+
+    Write-Log (
+        "Agent $LogNumber of $($Results.Count): " +
+        "ComputerName='$($Agent.ComputerName)'; " +
+        "AccountName='$($Agent.AccountName)'; " +
+        "SiteName='$($Agent.SiteName)'; " +
+        "GroupName='$($Agent.GroupName)'; " +
+        "OperatingSystem='$($Agent.OperatingSystem)'; " +
+        "AgentVersion='$($Agent.AgentVersion)'; " +
+        "SentinelOneId='$($Agent.SentinelOneId)'; " +
+        "LastActiveCentral='$($Agent.LastActiveDisplay)'; " +
+        "DaysOffline='$($Agent.DaysOffline)'"
+    )
+}
+
+Write-Log "========================================================"
+Write-Log "End of SentinelOne offline-agent list."
+Write-Log "========================================================"
+
+    Write-Host $ConsoleTable
+
+    # ========================================================
+    # Build ticket description
+    # ========================================================
+
+    Write-Log "Building ConnectWise ticket description."
+
+    $TicketDescription = New-AgentReportText `
+        -Agents $Results `
+        -ReportDate $CurrentUtc `
+        -CutoffDate $CutoffDate `
+        -ThresholdDays $OfflineDaysThreshold
+
+    Write-Log "ConnectWise ticket description created."
+
+    # ========================================================
+    # Create ConnectWise ticket
+    # ========================================================
+
+    Write-Log "Creating ConnectWise PSA ticket."
+
+    $CreatedTicket = New-ConnectWiseTicket `
+        -BaseUrl $ConnectWiseBaseUrl `
+        -Headers $ConnectWiseHeaders `
+        -Summary $TicketSummary `
+        -Description $TicketDescription `
+        -CompanyIdentifier $TicketCompanyIdentifier `
+        -BoardName $TicketBoardName `
+        -StatusName $TicketStatusName `
+        -PriorityName $TicketPriorityName `
+        -TypeName $TicketTypeName `
+        -SubtypeName $TicketSubtypeName `
+        -ItemName $TicketItemName
+
+    Write-Log "ConnectWise PSA ticket created successfully."
+
+    Write-Log (
+        "ConnectWise HTTP status: " +
+        "$($CreatedTicket.StatusCode)"
+    )
+
+    if ($null -ne $CreatedTicket.Ticket) {
+        if ($CreatedTicket.Ticket.id) {
+            Write-Log (
+                "Ticket ID: " +
+                "$($CreatedTicket.Ticket.id)"
+            )
+        }
+
+        if ($CreatedTicket.Ticket.summary) {
+            Write-Log (
+                "Ticket summary: " +
+                "$($CreatedTicket.Ticket.summary)"
+            )
+        }
+    }
+
+    if ($CreatedTicket.RedirectLocation) {
+        Write-Log (
+            "ConnectWise redirect was intentionally not followed."
+        )
+    }
+
+    Write-Log "Function completed successfully."
+}
+catch {
+    $ErrorMessage = $_.Exception.Message
+
+    Write-Log `
+        -Message "Function failed: $ErrorMessage" `
+        -Level "ERROR"
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            $_.ScriptStackTrace
+        )
+    ) {
+        Write-Log `
+            -Message "Stack trace: $($_.ScriptStackTrace)" `
+            -Level "ERROR"
+    }
+
+    if (
+        $null -ne $_.ErrorDetails -and
+        -not [string]::IsNullOrWhiteSpace(
+            $_.ErrorDetails.Message
+        )
+    ) {
+        Write-Log `
+            -Message "API response: $($_.ErrorDetails.Message)" `
+            -Level "ERROR"
+    }
+
+    throw
+}
