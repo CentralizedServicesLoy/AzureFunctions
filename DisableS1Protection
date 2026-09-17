@@ -1,0 +1,274 @@
+using namespace System.Net
+
+param(
+    $Request,
+    $TriggerMetadata
+)
+
+# ============================================================
+# Configuration
+# ============================================================
+
+$SentinelOneUrl = $env:SENTINELONE_URL
+$ApiToken       = $env:SENTINELONE_API_TOKEN
+
+function Send-HttpResponse {
+    param(
+        [Parameter(Mandatory)]
+        [int]$StatusCode,
+
+        [Parameter(Mandatory)]
+        [object]$Body
+    )
+
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = $StatusCode
+        Headers    = @{
+            "Content-Type" = "application/json"
+        }
+        Body = $Body | ConvertTo-Json -Depth 10
+    })
+}
+
+try {
+    # ========================================================
+    # Validate Function App configuration
+    # ========================================================
+
+    if ([string]::IsNullOrWhiteSpace($SentinelOneUrl)) {
+        throw "Application setting SENTINELONE_URL is missing."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ApiToken)) {
+        throw "Application setting SENTINELONE_API_TOKEN is missing."
+    }
+
+    $SentinelOneUrl = $SentinelOneUrl.TrimEnd("/")
+
+    $Headers = @{
+        Authorization = "ApiToken $ApiToken"
+        Accept        = "application/json"
+    }
+
+    # ========================================================
+    # Read request parameters
+    # Supports JSON body or query-string parameters
+    # ========================================================
+
+    $ComputerName   = $Request.Body.computerName
+    $DisableMinutes = $Request.Body.disableMinutes
+
+    if ([string]::IsNullOrWhiteSpace([string]$ComputerName)) {
+        $ComputerName = $Request.Query.computerName
+    }
+
+    if ($null -eq $DisableMinutes -or
+        [string]::IsNullOrWhiteSpace([string]$DisableMinutes)) {
+
+        $DisableMinutes = $Request.Query.disableMinutes
+    }
+
+    # ========================================================
+    # Validate request parameters
+    # ========================================================
+
+    if ([string]::IsNullOrWhiteSpace([string]$ComputerName)) {
+        Send-HttpResponse `
+            -StatusCode 400 `
+            -Body @{
+                success = $false
+                error   = "computerName is required."
+            }
+
+        return
+    }
+
+    $ComputerName = ([string]$ComputerName).Trim()
+
+    $ParsedDisableMinutes = 0
+
+    if (-not [int]::TryParse(
+        [string]$DisableMinutes,
+        [ref]$ParsedDisableMinutes
+    )) {
+        Send-HttpResponse `
+            -StatusCode 400 `
+            -Body @{
+                success = $false
+                error   = "disableMinutes must be a whole number."
+            }
+
+        return
+    }
+
+    if ($ParsedDisableMinutes -lt 1 -or
+        $ParsedDisableMinutes -gt 10080) {
+
+        Send-HttpResponse `
+            -StatusCode 400 `
+            -Body @{
+                success = $false
+                error   = "disableMinutes must be between 1 and 10080."
+            }
+
+        return
+    }
+
+    $ExpirationUtc = (Get-Date).
+        ToUniversalTime().
+        AddMinutes($ParsedDisableMinutes).
+        ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+
+    Write-Host ""
+    Write-Host "SENTINELONE AGENT DISABLE"
+    Write-Host ""
+    Write-Host "Requested computer: $ComputerName"
+    Write-Host "Disable minutes:    $ParsedDisableMinutes"
+    Write-Host "Expiration UTC:     $ExpirationUtc"
+    Write-Host "Should reboot:      False"
+    Write-Host ""
+
+    # ========================================================
+    # Find exact SentinelOne agent
+    # ========================================================
+
+    $EncodedComputerName = [uri]::EscapeDataString($ComputerName)
+
+    $AgentResult = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$SentinelOneUrl/web/api/v2.1/agents?computerName__contains=$EncodedComputerName&limit=100" `
+        -Headers $Headers `
+        -ErrorAction Stop
+
+    $MatchingAgents = @(
+        $AgentResult.data |
+            Where-Object {
+                $_.computerName -ieq $ComputerName
+            }
+    )
+
+    if ($MatchingAgents.Count -eq 0) {
+        Write-Host "Agent lookup failed: computer not found."
+
+        Send-HttpResponse `
+            -StatusCode 404 `
+            -Body @{
+                success      = $false
+                error        = "Computer was not found in SentinelOne."
+                computerName = $ComputerName
+            }
+
+        return
+    }
+
+    if ($MatchingAgents.Count -gt 1) {
+        Write-Host "Agent lookup failed: multiple exact matches found."
+        Write-Host "Match count: $($MatchingAgents.Count)"
+
+        Send-HttpResponse `
+            -StatusCode 409 `
+            -Body @{
+                success      = $false
+                error        = "More than one SentinelOne agent matched the computer name."
+                computerName = $ComputerName
+                matches      = @(
+                    $MatchingAgents |
+                        Select-Object id, computerName, siteName, agentVersion
+                )
+            }
+
+        return
+    }
+
+    $Agent = $MatchingAgents[0]
+
+    Write-Host "Agent found."
+    Write-Host ""
+    Write-Host "Computer:        $($Agent.computerName)"
+    Write-Host "Agent ID:        $($Agent.id)"
+    Write-Host "Site:            $($Agent.siteName)"
+    Write-Host "Current version: $($Agent.agentVersion)"
+    Write-Host ""
+
+    # ========================================================
+    # Disable agent
+    # ========================================================
+
+    $DisableBody = @{
+        data = @{
+            shouldReboot = $false
+            expiration   = $ExpirationUtc
+        }
+        filter = @{
+            ids = @(
+                [string]$Agent.id
+            )
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $DisableResult = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$SentinelOneUrl/web/api/v2.1/agents/actions/disable-agent" `
+        -Headers $Headers `
+        -ContentType "application/json" `
+        -Body $DisableBody `
+        -ErrorAction Stop
+
+    $Affected = [int]$DisableResult.data.affected
+
+    if ($Affected -ne 1) {
+        throw "SentinelOne reported $Affected affected agents instead of 1."
+    }
+
+    Write-Host "Disable request submitted successfully."
+    Write-Host "Agents affected: $Affected"
+    Write-Host ""
+
+    Send-HttpResponse `
+        -StatusCode 200 `
+        -Body @{
+            success        = $true
+            message        = "SentinelOne agent disable request submitted."
+            computerName   = $Agent.computerName
+            agentId        = [string]$Agent.id
+            siteName       = $Agent.siteName
+            agentVersion   = $Agent.agentVersion
+            disableMinutes = $ParsedDisableMinutes
+            expirationUtc  = $ExpirationUtc
+            shouldReboot   = $false
+            affected       = $Affected
+        }
+}
+catch {
+    $StatusCode  = 500
+    $ApiResponse = $null
+
+    if ($_.Exception.Response) {
+        try {
+            $StatusCode = [int]$_.Exception.Response.StatusCode
+        }
+        catch {
+            $StatusCode = 500
+        }
+    }
+
+    if ($_.ErrorDetails.Message) {
+        $ApiResponse = $_.ErrorDetails.Message
+    }
+
+    Write-Host ""
+    Write-Host "SentinelOne disable request failed."
+    Write-Host "Error: $($_.Exception.Message)"
+
+    if ($ApiResponse) {
+        Write-Host "API response: $ApiResponse"
+    }
+
+    Send-HttpResponse `
+        -StatusCode $StatusCode `
+        -Body @{
+            success     = $false
+            error       = $_.Exception.Message
+            apiResponse = $ApiResponse
+        }
+}
